@@ -780,7 +780,8 @@ ipcMain.handle('config:set-all', (_, cfg) => {
         configStore.getModel(),
         configStore.getApiUrl(),
         configStore.getApiKey(),
-        configStore.getMaxTokens()
+        configStore.getMaxTokens(),
+        configStore.getContextLength()  // 传入 contextLength
       );
     } catch (err) {
       logger.error(`Error updating agent for session ${sessionId}:`, err);
@@ -812,6 +813,52 @@ ipcMain.handle('config:test-connection', async (_, { apiKey, apiUrl, model }) =>
   } catch (error: any) {
     logger.error('[Config] Test failed:', error);
     return { success: false, message: error.message || 'Connection failed' };
+  }
+})
+
+// Context Compression Configuration
+ipcMain.handle('config:get-compression', () => {
+  return configStore.getCompressionConfig();
+})
+
+ipcMain.handle('config:set-compression', (_, { providerId, config }) => {
+  if (providerId) {
+    configStore.setProviderCompressionConfig(providerId, config);
+  } else {
+    configStore.setGlobalCompressionConfig(config);
+  }
+})
+
+// Context Length Configuration
+ipcMain.handle('config:get-context-length', (_, providerId?: string) => {
+  if (providerId) {
+    return configStore.getProviderContextLength(providerId);
+  }
+  return configStore.getContextLength();
+})
+
+ipcMain.handle('config:set-context-length', (_, { providerId, contextLength }: { providerId?: string; contextLength: number }) => {
+  if (providerId) {
+    configStore.setProviderContextLength(providerId, contextLength);
+  } else {
+    configStore.setContextLength(contextLength);
+  }
+
+  // Hot-Swap: Update all active agents
+  const stats = agentManager.getStats();
+  for (const sessionId of stats.sessions) {
+    try {
+      const agent = agentManager.getAgent(sessionId);
+      agent.updateConfig(
+        configStore.getModel(),
+        configStore.getApiUrl(),
+        configStore.getApiKey(),
+        configStore.getMaxTokens(),
+        contextLength
+      );
+    } catch (err) {
+      logger.error(`Error updating agent for session ${sessionId}:`, err);
+    }
   }
 })
 

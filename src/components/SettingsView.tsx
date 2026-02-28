@@ -24,6 +24,7 @@ interface ProviderConfig {
     apiUrl: string;
     model: string;
     maxTokens?: number;
+    contextLength?: number;    // 模型支持的上下文长度
     isCustom?: boolean;
     readonlyUrl?: boolean;
 }
@@ -56,6 +57,20 @@ interface ToolPermission {
     tool: string;
     pathPattern?: string;
     grantedAt: number;
+}
+
+// 压缩配置接口
+interface CompressionConfig {
+    enabled: boolean;
+    maxContextSize: number;
+    compressionThreshold: number;
+    autoCondenseEnabled: boolean;
+    condenseThresholdPercent: number;
+    maxSummaryTokens: number;
+    truncateFallbackEnabled: boolean;
+    truncateKeepMessages: number;
+    truncateKeepToolResults: number;
+    aggressiveMode: boolean;
 }
 
 interface TrustedHubProps {
@@ -157,6 +172,21 @@ export function SettingsView({ onClose }: SettingsViewProps) {
 
     const [updateInfo, setUpdateInfo] = useState<{ hasUpdate: boolean, latestVersion: string, releaseUrl: string } | null>(null);
     const [isLoading, setIsLoading] = useState(true);
+
+    // 压缩配置状态
+    const [compressionConfig, setCompressionConfig] = useState<CompressionConfig>({
+        enabled: true,
+        maxContextSize: 200000,
+        compressionThreshold: 75,
+        autoCondenseEnabled: true,
+        condenseThresholdPercent: 60,
+        maxSummaryTokens: 8000,
+        truncateFallbackEnabled: true,
+        truncateKeepMessages: 20,
+        truncateKeepToolResults: 3,
+        aggressiveMode: false
+    });
+    const [savingCompression, setSavingCompression] = useState(false);
 
     useEffect(() => {
         // Fetch app info
@@ -267,6 +297,8 @@ export function SettingsView({ onClose }: SettingsViewProps) {
                         apiKey: '',
                         apiUrl: '',
                         model: '',
+                        maxTokens: 8192,
+                        contextLength: 200000,
                         isCustom: true
                     };
                 }
@@ -284,8 +316,38 @@ export function SettingsView({ onClose }: SettingsViewProps) {
             refreshSkills();
         } else if (activeTab === 'advanced') {
             loadPermissions();
+            loadCompressionConfig();
         }
-    }, [activeTab]);
+    }, [activeTab, config.activeProviderId]);
+
+    // 加载压缩配置
+    const loadCompressionConfig = async () => {
+        try {
+            const cfg = await window.ipcRenderer?.invoke('config:get-compression') as CompressionConfig;
+            if (cfg) {
+                setCompressionConfig(cfg);
+            }
+        } catch (error) {
+            logger.error('Failed to load compression config:', error);
+        }
+    };
+
+    // 保存压缩配置
+    const handleSaveCompressionConfig = async () => {
+        setSavingCompression(true);
+        try {
+            await window.ipcRenderer?.invoke('config:set-compression', {
+                providerId: config.activeProviderId,
+                config: compressionConfig
+            });
+            setSaved(true);
+            setTimeout(() => setSaved(false), 2000);
+        } catch (error) {
+            logger.error('Failed to save compression config:', error);
+        } finally {
+            setSavingCompression(false);
+        }
+    };
 
     const handleShortcutKeyDown = (e: React.KeyboardEvent) => {
         e.preventDefault();
@@ -682,20 +744,49 @@ export function SettingsView({ onClose }: SettingsViewProps) {
                                                         {t('maxTokens') || '最大 Token 数'}
                                                     </label>
                                                     <span className="text-[10px] text-stone-400 dark:text-zinc-500">
-                                                        {t('maxTokensDesc') || '默认 131072，根据 API 限制调整'}
+                                                        {t('maxTokensDesc') || '默认 8192，根据 API 限制调整'}
                                                     </span>
                                                 </div>
                                                 <input
                                                     type="number"
                                                     min="1"
                                                     max="200000"
-                                                    value={config.providers[config.activeProviderId].maxTokens || 131072}
+                                                    value={config.providers[config.activeProviderId].maxTokens || 8192}
                                                     onChange={(e) => {
-                                                        const value = parseInt(e.target.value) || 131072;
+                                                        const value = parseInt(e.target.value) || 8192;
                                                         const newProviders = { ...config.providers };
                                                         newProviders[config.activeProviderId] = {
                                                             ...newProviders[config.activeProviderId],
                                                             maxTokens: value
+                                                        };
+                                                        setConfig({ ...config, providers: newProviders });
+                                                    }}
+                                                    onBlur={handleForceSave}
+                                                    className="w-full bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm text-stone-700 dark:text-zinc-200 focus:outline-none focus:ring-2 focus:ring-orange-500/20 focus:border-orange-500"
+                                                />
+                                            </div>
+
+                                            <div className="mt-3">
+                                                <div className="flex items-center justify-between mb-1.5">
+                                                    <label className="text-xs font-medium text-stone-500 dark:text-zinc-400">
+                                                        上下文长度
+                                                    </label>
+                                                    <span className="text-[10px] text-stone-400 dark:text-zinc-500">
+                                                        模型支持的输入上下文上限，压缩触发基于此值
+                                                    </span>
+                                                </div>
+                                                <input
+                                                    type="number"
+                                                    min="1000"
+                                                    max="1000000"
+                                                    step="1000"
+                                                    value={config.providers[config.activeProviderId].contextLength || 200000}
+                                                    onChange={(e) => {
+                                                        const value = parseInt(e.target.value) || 200000;
+                                                        const newProviders = { ...config.providers };
+                                                        newProviders[config.activeProviderId] = {
+                                                            ...newProviders[config.activeProviderId],
+                                                            contextLength: value
                                                         };
                                                         setConfig({ ...config, providers: newProviders });
                                                     }}
@@ -1159,6 +1250,281 @@ export function SettingsView({ onClose }: SettingsViewProps) {
                                             >
                                                 {t('clearAllPermissions')}
                                             </button>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Context Compression Settings */}
+                                <div className="bg-white dark:bg-zinc-900 rounded-lg p-6 border border-stone-200 dark:border-zinc-700">
+                                    <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                                        <Activity size={20} />
+                                        上下文压缩设置
+                                    </h3>
+
+                                    {/* Info Box - 显示上下文长度和压缩触发条件 */}
+                                    <div className="mb-6 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+                                        <div className="flex items-start gap-3">
+                                            <Info size={16} className="text-blue-600 dark:text-blue-400 shrink-0 mt-0.5" />
+                                            <div className="space-y-2 text-sm">
+                                                <p className="font-medium text-blue-700 dark:text-blue-300">压缩触发条件</p>
+                                                <div className="text-xs text-blue-600 dark:text-blue-400 space-y-1">
+                                                    <p>• 当前模型上下文长度：<strong>{(config.providers[config.activeProviderId]?.contextLength || 200000).toLocaleString()}</strong> tokens</p>
+                                                    <p>• 压缩触发阈值：<strong>{compressionConfig.compressionThreshold}%</strong></p>
+                                                    <p>• 预计在上下文达到 <strong>{Math.round((config.providers[config.activeProviderId]?.contextLength || 200000) * compressionConfig.compressionThreshold / 100).toLocaleString()}</strong> tokens 时触发压缩</p>
+                                                    <p className="text-[10px] opacity-75 mt-2">💡 在 API 设置中可以调整各模型的"上下文长度"参数</p>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Enable Compression */}
+                                    <div className="mb-6">
+                                        <div className="flex items-center justify-between">
+                                            <div>
+                                                <label className="text-sm font-medium text-stone-700 dark:text-zinc-200">
+                                                    启用智能压缩
+                                                </label>
+                                                <p className="text-xs text-stone-500 dark:text-zinc-400 mt-1">
+                                                    当上下文接近限制时自动压缩历史对话
+                                                </p>
+                                            </div>
+                                            <button
+                                                onClick={() => setCompressionConfig({
+                                                    ...compressionConfig,
+                                                    enabled: !compressionConfig.enabled
+                                                })}
+                                                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                                    compressionConfig.enabled
+                                                        ? 'bg-orange-500'
+                                                        : 'bg-stone-200 dark:bg-zinc-700'
+                                                }`}
+                                            >
+                                                <span
+                                                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                        compressionConfig.enabled ? 'translate-x-6' : 'translate-x-1'
+                                                    }`}
+                                                />
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    {compressionConfig.enabled && (
+                                        <div className="space-y-6">
+                                            {/* Compression Threshold */}
+                                            <div>
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <label className="text-sm font-medium text-stone-700 dark:text-zinc-200">
+                                                        压缩触发阈值
+                                                    </label>
+                                                    <span className="text-sm text-orange-600 dark:text-orange-400 font-medium">
+                                                        {compressionConfig.compressionThreshold}%
+                                                    </span>
+                                                </div>
+                                                <input
+                                                    type="range"
+                                                    min="50"
+                                                    max="95"
+                                                    value={compressionConfig.compressionThreshold}
+                                                    onChange={(e) => setCompressionConfig({
+                                                        ...compressionConfig,
+                                                        compressionThreshold: parseInt(e.target.value)
+                                                    })}
+                                                    className="w-full h-2 bg-stone-200 dark:bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                                                />
+                                                <p className="text-xs text-stone-500 dark:text-zinc-400 mt-1">
+                                                    当上下文使用超过此百分比时触发压缩
+                                                </p>
+                                            </div>
+
+                                            {/* Smart Summary Configuration */}
+                                            <div className="border-t border-stone-200 dark:border-zinc-700 pt-4">
+                                                <div className="flex items-center justify-between mb-4">
+                                                    <div>
+                                                        <label className="text-sm font-medium text-stone-700 dark:text-zinc-200">
+                                                            启用 AI 摘要压缩
+                                                        </label>
+                                                        <p className="text-xs text-stone-500 dark:text-zinc-400 mt-1">
+                                                            使用 AI 生成对话摘要（推荐）
+                                                        </p>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => setCompressionConfig({
+                                                            ...compressionConfig,
+                                                            autoCondenseEnabled: !compressionConfig.autoCondenseEnabled
+                                                        })}
+                                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                                            compressionConfig.autoCondenseEnabled
+                                                                ? 'bg-orange-500'
+                                                                : 'bg-stone-200 dark:bg-zinc-700'
+                                                        }`}
+                                                    >
+                                                        <span
+                                                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                                compressionConfig.autoCondenseEnabled ? 'translate-x-6' : 'translate-x-1'
+                                                            }`}
+                                                        />
+                                                    </button>
+                                                </div>
+
+                                                {compressionConfig.autoCondenseEnabled && (
+                                                    <div className="space-y-4 ml-4">
+                                                        {/* Summary Trigger Threshold */}
+                                                        <div>
+                                                            <div className="flex items-center justify-between mb-2">
+                                                                <label className="text-sm font-medium text-stone-700 dark:text-zinc-200">
+                                                                    摘要触发阈值
+                                                                </label>
+                                                                <span className="text-sm text-orange-600 dark:text-orange-400 font-medium">
+                                                                    {compressionConfig.condenseThresholdPercent}%
+                                                                </span>
+                                                            </div>
+                                                            <input
+                                                                type="range"
+                                                                min="40"
+                                                                max="80"
+                                                                value={compressionConfig.condenseThresholdPercent}
+                                                                onChange={(e) => setCompressionConfig({
+                                                                    ...compressionConfig,
+                                                                    condenseThresholdPercent: parseInt(e.target.value)
+                                                                })}
+                                                                className="w-full h-2 bg-stone-200 dark:bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+                                                            />
+                                                        </div>
+
+                                                        {/* Max Summary Tokens */}
+                                                        <div>
+                                                            <label className="text-sm font-medium text-stone-700 dark:text-zinc-200 block mb-2">
+                                                                最大摘要 Token 数
+                                                            </label>
+                                                            <input
+                                                                type="number"
+                                                                min="1000"
+                                                                max="16000"
+                                                                step="1000"
+                                                                value={compressionConfig.maxSummaryTokens}
+                                                                onChange={(e) => setCompressionConfig({
+                                                                    ...compressionConfig,
+                                                                    maxSummaryTokens: parseInt(e.target.value) || 8000
+                                                                })}
+                                                                className="w-full bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm text-stone-700 dark:text-zinc-200"
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Truncate Fallback Configuration */}
+                                            <div className="border-t border-stone-200 dark:border-zinc-700 pt-4">
+                                                <div className="flex items-center justify-between mb-4">
+                                                    <div>
+                                                        <label className="text-sm font-medium text-stone-700 dark:text-zinc-200">
+                                                            启用截断回退
+                                                        </label>
+                                                        <p className="text-xs text-stone-500 dark:text-zinc-400 mt-1">
+                                                            摘要失败时使用滑动窗口截断
+                                                        </p>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => setCompressionConfig({
+                                                            ...compressionConfig,
+                                                            truncateFallbackEnabled: !compressionConfig.truncateFallbackEnabled
+                                                        })}
+                                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                                            compressionConfig.truncateFallbackEnabled
+                                                                ? 'bg-orange-500'
+                                                                : 'bg-stone-200 dark:bg-zinc-700'
+                                                        }`}
+                                                    >
+                                                        <span
+                                                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                                compressionConfig.truncateFallbackEnabled ? 'translate-x-6' : 'translate-x-1'
+                                                            }`}
+                                                        />
+                                                    </button>
+                                                </div>
+
+                                                {compressionConfig.truncateFallbackEnabled && (
+                                                    <div className="space-y-4 ml-4">
+                                                        {/* Keep Messages */}
+                                                        <div>
+                                                            <label className="text-sm font-medium text-stone-700 dark:text-zinc-200 block mb-2">
+                                                                保留最近消息数
+                                                            </label>
+                                                            <input
+                                                                type="number"
+                                                                min="5"
+                                                                max="50"
+                                                                value={compressionConfig.truncateKeepMessages}
+                                                                onChange={(e) => setCompressionConfig({
+                                                                    ...compressionConfig,
+                                                                    truncateKeepMessages: parseInt(e.target.value) || 20
+                                                                })}
+                                                                className="w-full bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm text-stone-700 dark:text-zinc-200"
+                                                            />
+                                                        </div>
+
+                                                        {/* Keep Tool Results */}
+                                                        <div>
+                                                            <label className="text-sm font-medium text-stone-700 dark:text-zinc-200 block mb-2">
+                                                                保留工具结果数
+                                                            </label>
+                                                            <input
+                                                                type="number"
+                                                                min="1"
+                                                                max="10"
+                                                                value={compressionConfig.truncateKeepToolResults}
+                                                                onChange={(e) => setCompressionConfig({
+                                                                    ...compressionConfig,
+                                                                    truncateKeepToolResults: parseInt(e.target.value) || 3
+                                                                })}
+                                                                className="w-full bg-white dark:bg-zinc-900 border border-stone-200 dark:border-zinc-700 rounded-lg px-3 py-2 text-sm text-stone-700 dark:text-zinc-200"
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Aggressive Mode */}
+                                            <div className="border-t border-stone-200 dark:border-zinc-700 pt-4">
+                                                <div className="flex items-center justify-between">
+                                                    <div>
+                                                        <label className="text-sm font-medium text-stone-700 dark:text-zinc-200">
+                                                            激进模式
+                                                        </label>
+                                                        <p className="text-xs text-stone-500 dark:text-zinc-400 mt-1">
+                                                            更早触发压缩，适用于长对话
+                                                        </p>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => setCompressionConfig({
+                                                            ...compressionConfig,
+                                                            aggressiveMode: !compressionConfig.aggressiveMode
+                                                        })}
+                                                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                                                            compressionConfig.aggressiveMode
+                                                                ? 'bg-orange-500'
+                                                                : 'bg-stone-200 dark:bg-zinc-700'
+                                                        }`}
+                                                    >
+                                                        <span
+                                                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                                                                compressionConfig.aggressiveMode ? 'translate-x-6' : 'translate-x-1'
+                                                            }`}
+                                                        />
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            {/* Save Button */}
+                                            <div className="mt-6 flex justify-end">
+                                                <button
+                                                    onClick={handleSaveCompressionConfig}
+                                                    disabled={savingCompression}
+                                                    className="px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                                                >
+                                                    {savingCompression ? '保存中...' : '保存压缩配置'}
+                                                </button>
+                                            </div>
                                         </div>
                                     )}
                                 </div>

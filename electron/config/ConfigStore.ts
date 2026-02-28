@@ -1,5 +1,6 @@
 import Store from 'electron-store';
 import logger from '../services/Logger';
+import { CompressionConfig } from '../agent/compression/types';
 
 export interface ToolPermission {
     tool: string;           // 'write_file', 'run_command', etc.
@@ -13,9 +14,11 @@ export interface ProviderConfig {
     apiKey: string;
     apiUrl: string;
     model: string;
-    maxTokens?: number;
+    maxTokens?: number;           // 单次输出最大 token 数
+    contextLength?: number;       // 模型支持的上下文长度（seq length）
     isCustom?: boolean;
     readonlyUrl?: boolean;
+    compressionConfig?: Partial<CompressionConfig>;  // 压缩配置（可选）
 }
 
 export type TrustLevel = 'strict' | 'standard' | 'trust';
@@ -36,9 +39,13 @@ export interface AppConfig {
     // Multi-Provider
     activeProviderId: string;
     providers: Record<string, ProviderConfig>;
+
+    // Context Compression
+    globalCompressionConfig?: Partial<CompressionConfig>;  // 全局压缩配置（可覆盖 Provider 级别配置）
 }
 
-const DEFAULT_MAX_TOKENS = 131072;
+const DEFAULT_MAX_TOKENS = 8192;           // 默认输出最大 token 数
+const DEFAULT_CONTEXT_LENGTH = 200000;       // 默认上下文长度（200k）
 
 // Default provider configurations
 const defaultProviders: Record<string, ProviderConfig> = {
@@ -49,6 +56,7 @@ const defaultProviders: Record<string, ProviderConfig> = {
         apiUrl: 'https://open.bigmodel.cn/api/anthropic',
         model: 'glm-4.7',
         maxTokens: DEFAULT_MAX_TOKENS,
+        contextLength: DEFAULT_CONTEXT_LENGTH,
         readonlyUrl: true
     },
     'zai': {
@@ -58,6 +66,7 @@ const defaultProviders: Record<string, ProviderConfig> = {
         apiUrl: 'https://api.z.ai/api/anthropic', // Placeholder, verify ZAI endpoint
         model: 'glm-4.7', // Assuming ZAI uses similar models or map later
         maxTokens: DEFAULT_MAX_TOKENS,
+        contextLength: DEFAULT_CONTEXT_LENGTH,
         readonlyUrl: true
     },
     'minimax_cn': {
@@ -67,6 +76,7 @@ const defaultProviders: Record<string, ProviderConfig> = {
         apiUrl: 'https://api.minimaxi.com/anthropic',
         model: 'MiniMax-M2.1',
         maxTokens: DEFAULT_MAX_TOKENS,
+        contextLength: DEFAULT_CONTEXT_LENGTH,
         readonlyUrl: true
     },
     'minimax_intl': {
@@ -76,6 +86,7 @@ const defaultProviders: Record<string, ProviderConfig> = {
         apiUrl: 'https://api.minimax.io/anthropic', // This uses Anthropic protocol
         model: 'MiniMax-M2.1',
         maxTokens: DEFAULT_MAX_TOKENS,
+        contextLength: DEFAULT_CONTEXT_LENGTH,
         readonlyUrl: true
     },
     'custom': {
@@ -85,6 +96,7 @@ const defaultProviders: Record<string, ProviderConfig> = {
         apiUrl: '',
         model: '',
         maxTokens: DEFAULT_MAX_TOKENS,
+        contextLength: DEFAULT_CONTEXT_LENGTH,
         isCustom: true,
         readonlyUrl: false
     }
@@ -160,6 +172,22 @@ class ConfigStore {
                 return item;
             });
             this.store.set('authorizedFolders', newFolders);
+        }
+
+        // Migrate providers: add contextLength if missing (use maxTokens as fallback)
+        const providers = this.store.get('providers');
+        if (providers) {
+            let needsUpdate = false;
+            for (const [, provider] of Object.entries(providers)) {
+                if (!(provider as any).contextLength) {
+                    (provider as any).contextLength = (provider as any).maxTokens || DEFAULT_CONTEXT_LENGTH;
+                    needsUpdate = true;
+                }
+            }
+            if (needsUpdate) {
+                this.store.set('providers', providers);
+                logger.debug('[ConfigStore] Migrated providers: added contextLength field');
+            }
         }
     }
 
@@ -464,6 +492,90 @@ class ConfigStore {
 
     setProviderMaxTokens(providerId: string, maxTokens: number): void {
         this.updateProvider(providerId, { maxTokens });
+    }
+
+    // Context Length Configuration (上下文窗口长度)
+    getContextLength(): number {
+        const active = this.getActiveProviderId();
+        return this.getProvider(active)?.contextLength || DEFAULT_CONTEXT_LENGTH;
+    }
+
+    setContextLength(contextLength: number): void {
+        const active = this.getActiveProviderId();
+        this.updateProvider(active, { contextLength });
+    }
+
+    getProviderContextLength(providerId: string): number {
+        return this.getProvider(providerId)?.contextLength || DEFAULT_CONTEXT_LENGTH;
+    }
+
+    setProviderContextLength(providerId: string, contextLength: number): void {
+        this.updateProvider(providerId, { contextLength });
+    }
+
+    // === Context Compression Configuration ===
+
+    /**
+     * 获取完整的压缩配置
+     * 优先级：Provider 配置 > 全局配置 > 默认配置
+     */
+    getCompressionConfig(providerId?: string): CompressionConfig {
+        const activeId = providerId || this.getActiveProviderId();
+        const provider = this.getProvider(activeId);
+        const globalConfig = this.store.get('globalCompressionConfig') || {};
+
+        // 使用 contextLength（上下文长度）而不是 maxTokens（输出长度）
+        const contextLength = provider?.contextLength || DEFAULT_CONTEXT_LENGTH;
+
+        const defaultConfig: CompressionConfig = {
+            enabled: true,
+            maxContextSize: contextLength,
+            compressionThreshold: 75,
+            autoCondenseEnabled: true,
+            condenseThresholdPercent: 60,
+            maxSummaryTokens: 8000,
+            truncateFallbackEnabled: true,
+            truncateKeepMessages: 20,
+            truncateKeepToolResults: 3,
+            preservePatterns: [],
+            aggressiveMode: false
+        };
+
+        return {
+            ...defaultConfig,
+            ...globalConfig,
+            ...provider?.compressionConfig,
+            // 确保 maxContextSize 使用 provider 的 contextLength（上下文长度）
+            maxContextSize: contextLength
+        };
+    }
+
+    /**
+     * 设置 Provider 的压缩配置
+     */
+    setProviderCompressionConfig(
+        providerId: string,
+        config: Partial<CompressionConfig>
+    ): void {
+        const providers = this.getAllProviders();
+        if (providers[providerId]) {
+            providers[providerId].compressionConfig = {
+                ...providers[providerId].compressionConfig,
+                ...config
+            };
+            this.store.set('providers', providers);
+            logger.debug(`[ConfigStore] Updated compression config for provider: ${providerId}`);
+        }
+    }
+
+    /**
+     * 设置全局压缩配置
+     */
+    setGlobalCompressionConfig(config: Partial<CompressionConfig>): void {
+        const currentConfig = this.store.get('globalCompressionConfig') || {};
+        const mergedConfig = { ...currentConfig, ...config };
+        this.store.set('globalCompressionConfig', mergedConfig);
+        logger.debug('[ConfigStore] Updated global compression config');
     }
 }
 

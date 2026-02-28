@@ -9,6 +9,8 @@ import { AutoMemoryManager } from '../memory/AutoMemoryManager';
 import { permissionManager } from './security/PermissionManager';
 import { configStore } from '../config/ConfigStore';
 import { backgroundTaskManager, BackgroundTask } from './BackgroundTaskManager';
+import { ContextCompressor } from './compression/ContextCompressor';
+import { Summarizer } from './compression/Summarizer';
 import os from 'os';
 import fs from 'fs';
 import logger from '../services/Logger';
@@ -94,6 +96,10 @@ export class AgentRuntime {
     private maxTokens: number;
     private lastProcessTime: number = 0;
 
+    // ⚠️ 保存 API 配置用于压缩器
+    private apiKey: string;
+    private apiUrl: string;
+
     // Session isolation - track which session this agent instance is serving
     private sessionId: string | null = null;
 
@@ -108,12 +114,17 @@ export class AgentRuntime {
     // Custom system prompt (for specialized agents like Memory Assistant)
     private customSystemPrompt: string | null = null;
 
+    // ⚠️ 新增：上下文压缩模块
+    private contextCompressor: ContextCompressor | null = null;
+
     // Background mode status check (used to avoid "unused variable" errors)
     private isBackgroundTask(): boolean {
         return this._isBackgroundMode || this._backgroundTaskId !== null || this._onProgressCallback !== undefined;
     }
 
     constructor(apiKey: string, window: BrowserWindow, model: string = 'claude-3-5-sonnet-20241022', apiUrl: string = 'https://api.anthropic.com', maxTokens: number = 131072) {
+        this.apiKey = apiKey;
+        this.apiUrl = apiUrl;
         this.anthropic = new Anthropic({ apiKey, baseURL: apiUrl });
         this.model = model;
         this.maxTokens = maxTokens;
@@ -133,15 +144,46 @@ export class AgentRuntime {
                 this.skillManager.loadSkills(),
                 this.mcpService.loadClients()
             ]);
+
+            // ⚠️ 初始化上下文压缩模块
+            this.initializeContextCompressor();
+
             logger.debug('AgentRuntime initialized (Skills & MCP loaded)');
         } catch (error) {
             logger.error('Failed to initialize AgentRuntime:', error);
         }
     }
 
+    /**
+     * 初始化上下文压缩模块
+     */
+    private initializeContextCompressor() {
+        try {
+            const compressionConfig = configStore.getCompressionConfig();
+            // ⚠️ 使用保存的配置参数创建 Summarizer
+            const summarizer = new Summarizer(
+                this.apiKey,      // 使用保存的 API Key
+                this.apiUrl,      // 使用保存的 API URL
+                this.model        // 使用保存的模型
+            );
+            this.contextCompressor = new ContextCompressor(compressionConfig, summarizer);
+            logger.debug('ContextCompressor initialized with config:', {
+                enabled: compressionConfig.enabled,
+                maxContextSize: compressionConfig.maxContextSize,
+                compressionThreshold: compressionConfig.compressionThreshold,
+                autoCondenseEnabled: compressionConfig.autoCondenseEnabled,
+                summaryModel: this.model,
+                summaryApiUrl: this.apiUrl
+            });
+        } catch (error) {
+            logger.error('Failed to initialize ContextCompressor:', error);
+            this.contextCompressor = null;
+        }
+    }
+
     // Hot-Swap Configuration without reloading context
-    public updateConfig(model: string, apiUrl?: string, apiKey?: string, maxTokens?: number) {
-        if (this.model === model && !apiUrl && !apiKey && maxTokens === undefined) return;
+    public updateConfig(model: string, apiUrl?: string, apiKey?: string, maxTokens?: number, contextLength?: number) {
+        if (this.model === model && !apiUrl && !apiKey && maxTokens === undefined && contextLength === undefined) return;
 
         this.model = model;
         if (maxTokens !== undefined) {
@@ -149,10 +191,20 @@ export class AgentRuntime {
         }
         // Re-create Anthropic client if credentials change
         if (apiUrl || apiKey) {
+            // 更新保存的配置
+            if (apiKey) this.apiKey = apiKey;
+            if (apiUrl) this.apiUrl = apiUrl;
+
             this.anthropic = new Anthropic({
-                apiKey: apiKey || this.anthropic.apiKey,
-                baseURL: apiUrl || this.anthropic.baseURL
+                apiKey: this.apiKey,
+                baseURL: this.apiUrl
             });
+
+            // ⚠️ 重新初始化压缩器以使用新的配置
+            this.initializeContextCompressor();
+        } else if (contextLength !== undefined) {
+            // ⚠️ contextLength 变化也需要重新初始化压缩器
+            this.initializeContextCompressor();
         }
         logger.debug(`Hot-Swap: Model updated to ${model}, maxTokens: ${this.maxTokens}`);
     }
@@ -847,13 +899,65 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
             // 不管是什么模型(Claude、DeepSeek、MiniMax、智谱等),都尝试启用 thinking 参数
             // 如果 API 不支持,会返回错误,我们自动降级到普通模式
             // 这样可以兼容所有支持 thinking 的模型,不会被"全部打死"
+
+            // ⚠️ 新增：智能上下文压缩（在 trimHistoryToFitContext 之前）
+            let historyForRequest = this.history;
+            if (this.contextCompressor) {
+                try {
+                    logger.debug(`[AgentRuntime] Checking if compression needed...`);
+                    const compressionTrigger = this.contextCompressor.shouldCompress(this.history);
+
+                    logger.debug(`[AgentRuntime] Compression check result:`, {
+                        shouldCompress: compressionTrigger.shouldCompress,
+                        currentTokens: compressionTrigger.currentTokens,
+                        maxTokens: compressionTrigger.maxTokens,
+                        thresholdPercent: compressionTrigger.thresholdPercent,
+                        reason: compressionTrigger.reason
+                    });
+
+                    if (compressionTrigger.shouldCompress) {
+                        logger.info(`[AgentRuntime] Context compression triggered: ${compressionTrigger.reason}`);
+
+                        const compressionResult = await this.contextCompressor.compress(
+                            this.history,
+                            compressionTrigger
+                        );
+
+                        if (compressionResult.metadata.success) {
+                            historyForRequest = compressionResult.compressedMessages;
+                            logger.info(`[AgentRuntime] Compression successful! Messages: ${this.history.length} → ${historyForRequest.length}`);
+
+                            // 通知前端压缩事件
+                            this.broadcast('agent:context-compressed', {
+                                strategy: compressionResult.strategy,
+                                originalTokens: compressionResult.originalTokens,
+                                compressedTokens: compressionResult.compressedTokens,
+                                compressionRatio: compressionResult.compressionRatio
+                            });
+                        } else {
+                            logger.warn('[AgentRuntime] Compression failed, using original history:', compressionResult.metadata.error);
+                        }
+                    } else {
+                        logger.debug(`[AgentRuntime] No compression needed. Context usage: ${((compressionTrigger.currentTokens / compressionTrigger.maxTokens) * 100).toFixed(1)}%`);
+                    }
+                } catch (error) {
+                    logger.error('[AgentRuntime] Compression error:', error);
+                    // 压缩失败不影响主流程，继续使用原始历史
+                }
+            } else {
+                logger.debug('[AgentRuntime] ContextCompressor not initialized, skipping compression check');
+            }
+
             // ⚠️ 关键修复：裁剪历史记录以避免超过模型的上下文长度限制
             // 默认限制为 200k tokens，为 200k 上下文的模型留出安全余量
             const MAX_CONTEXT_TOKENS = 200000;
-            const trimmedHistory = this.trimHistoryToFitContext(this.history, MAX_CONTEXT_TOKENS);
+            const trimmedHistory = this.trimHistoryToFitContext(historyForRequest, MAX_CONTEXT_TOKENS);
 
             let stream: any;
             try {
+                // ⚠️ 新增：记录请求日志
+                this.logApiRequest(trimmedHistory, tools);
+
                 const requestConfig: any = {
                     model: this.model,
                     max_tokens: this.maxTokens,
@@ -1044,6 +1148,9 @@ Remember: Plan internally, execute visibly. Focus on results, not process.`;
                     finalContent.push({ type: 'text', text: textBuffer, citations: null });
                     textBuffer = "";
                 }
+
+                // ⚠️ 新增：记录响应日志
+                this.logApiResponse(finalContent, textBuffer, thinkingBuffer);
 
                 if (finalContent.length > 0) {
                     const assistantMsg: Anthropic.MessageParam = { role: 'assistant', content: finalContent };
@@ -1538,6 +1645,102 @@ ${skillInfo.instructions}
         } finally {
             backgroundRuntime.dispose();
         }
+    }
+
+    /**
+     * 记录 API 请求日志
+     */
+    private logApiRequest(messages: Anthropic.MessageParam[], tools: Anthropic.Tool[]) {
+        const estimatedTokens = this.estimateHistoryTokens(messages);
+
+        logger.info(`
+╔══════════════════════════════════════════════════════════════╗
+║                    API Request                                ║
+╠══════════════════════════════════════════════════════════════╣
+║ Model:              ${this.model.padEnd(46)}║
+║ Max Tokens:         ${this.maxTokens.toString().padEnd(46)}║
+║ History Messages:   ${messages.length.toString().padEnd(46)}║
+║ Estimated Tokens:   ${estimatedTokens.toString().padEnd(46)}║
+║ Tools Available:    ${tools.length.toString().padEnd(46)}║
+╚══════════════════════════════════════════════════════════════╝
+        `);
+
+        // ⚠️ 记录完整的请求体
+        logger.info('========== API REQUEST BODY ==========');
+        logger.info(JSON.stringify({
+            model: this.model,
+            max_tokens: this.maxTokens,
+            messages: messages.map(msg => ({
+                role: msg.role,
+                content: typeof msg.content === 'string'
+                    ? msg.content.substring(0, 500) + (msg.content.length > 500 ? '...' : '')
+                    : msg.content.map(block => {
+                        if (block.type === 'text') {
+                            return { type: 'text', text: (block as any).text?.substring(0, 500) + (((block as any).text?.length || 0) > 500 ? '...' : '') };
+                        } else if (block.type === 'image') {
+                            return { type: 'image' };
+                        } else if (block.type === 'tool_use') {
+                            return { type: 'tool_use', name: (block as any).name, input_length: JSON.stringify((block as any).input).length };
+                        } else if (block.type === 'tool_result') {
+                            return { type: 'tool_result', content_length: JSON.stringify((block as any).content).length };
+                        }
+                        return block;
+                    })
+            })),
+            tools: tools.map(t => ({ name: t.name, description: t.description?.substring(0, 100) })),
+            stream: true
+        }, null, 2));
+        logger.info('========== END REQUEST BODY ==========\n');
+    }
+
+    /**
+     * 记录 API 响应日志
+     */
+    private logApiResponse(finalContent: Anthropic.ContentBlock[], textBuffer: string, thinkingBuffer: string) {
+        const toolUses = finalContent.filter(c => c.type === 'tool_use');
+
+        logger.info(`
+╔══════════════════════════════════════════════════════════════╗
+║                    API Response                               ║
+╠══════════════════════════════════════════════════════════════╣
+║ Content Blocks:     ${finalContent.length.toString().padEnd(46)}║
+║ Tool Uses:          ${toolUses.length.toString().padEnd(46)}║
+║ Text Length:        ${textBuffer.length.toString().padEnd(46)}║
+║ Has Thinking:       ${(thinkingBuffer.length > 0 ? 'Yes' : 'No').padEnd(44)}║
+╚══════════════════════════════════════════════════════════════╝
+        `);
+
+        // ⚠️ 记录完整的返回体
+        logger.info('========== API RESPONSE BODY ==========');
+        logger.info(JSON.stringify({
+            content_blocks: finalContent.map(block => {
+                if (block.type === 'text') {
+                    return { type: 'text', text: (block as any).text?.substring(0, 1000) + (((block as any).text?.length || 0) > 1000 ? '...' : '') };
+                } else if (block.type === 'tool_use') {
+                    return {
+                        type: 'tool_use',
+                        id: (block as any).id,
+                        name: (block as any).name,
+                        input: JSON.stringify((block as any).input).substring(0, 500) + '...'
+                    };
+                } else if (block.type === 'thinking') {
+                    return { type: 'thinking', length: (block as any).text?.length || 0 };
+                }
+                return { type: block.type };
+            }),
+            thinking_buffer_length: thinkingBuffer.length,
+            thinking_buffer_preview: thinkingBuffer.substring(0, 500) + (thinkingBuffer.length > 500 ? '...' : ''),
+            text_buffer_length: textBuffer.length,
+            text_buffer_preview: textBuffer.substring(0, 500) + (textBuffer.length > 500 ? '...' : '')
+        }, null, 2));
+        logger.info('========== END RESPONSE BODY ==========\n');
+    }
+
+    /**
+     * 估算历史记录的 tokens
+     */
+    private estimateHistoryTokens(history: Anthropic.MessageParam[]): number {
+        return history.reduce((total, msg) => total + this.estimateTokens(msg), 0);
     }
 
     public dispose() {
